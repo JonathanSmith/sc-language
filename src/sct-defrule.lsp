@@ -159,8 +159,7 @@
          (sc-code-or-filename &rest initargs)
        (apply #'rule:apply-rule
               sc-code-or-filename ',(ruleset-class-symbol name)
-              initargs))
-     ))
+              initargs))))
 
 ;; defrule
 (defun rulemethod-args (ruleset)

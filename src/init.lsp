@@ -40,6 +40,8 @@
 #+(and allegro mswindows) (setq *locale* (find-locale "japan.EUC"))
 ;; #+(and composer allegro) (wt:start-composer)
 
+#+sbcl(eval-when (:load-toplevel :compile-toplevel :execute)
+	(setf sb-impl::*default-external-format* :iso-8859-1))
 ;;; Printer settings
 (setq *print-case* :downcase)
 (setq *print-circle* nil)
@@ -54,7 +56,8 @@
 #+(or allegro cmu sbcl clisp)
 (setf (symbol-function 'bye)
       #+allegro #'exit
-      #+(or cmu sbcl) #'quit
+      #+(or cmu) #'quit
+      #+sbcl #'sb-unix::exit
       #+clisp #'ext::bye)
 
 ;;; Compile and load the SC system.

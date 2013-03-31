@@ -163,13 +163,13 @@
 
 ;;; コマンドラインの実行（実装依存部分を吸収）
 #+(and allegro mswindows) (defparameter *sh-command* "\\cygwin\\bin\\sh.exe")
-#+(or allegro kcl ecl cmu clisp)
+#+(or allegro kcl sbcl ecl cmu clisp)
 (defun command-line (command &key args verbose other-options)
-  (declare (string command) (list verbose) (list other-options))
+  (declare (string command) #+nil(list verbose) (list other-options))
   (let* ((quoted-cmd-args (mapcar #'(lambda (x) (add-paren
-                                                (substitute-string "'\''" #\' x)
-                                                #\'))
-                                 (cons command args)))
+						 (substitute-string "'\''" #\' x)
+						 #\'))
+				  (cons command args)))
          (cat-string
           #+(and allegro mswindows)
           (string+ *sh-command* " -c "
@@ -180,11 +180,11 @@
     (fresh-line verbose)
     #+allegro
     (multiple-value-bind (sout eout rval)
-                 (apply #'excl.osi:command-output cat-string :whole t
-                        other-options)
-               (when sout (format *error-output* "~&~A" sout))
-               (when eout (format *error-output* "~&~A" eout))
-               rval)
+	(apply #'excl.osi:command-output cat-string :whole t
+	       other-options)
+      (when sout (format *error-output* "~&~A" sout))
+      (when eout (format *error-output* "~&~A" eout))
+      rval)
     #+kcl(apply #'system cat-string other-options)
     #+ecl(apply #'si::system cat-string other-options)
     #+(or cmu clisp)
@@ -192,7 +192,18 @@
            #+clisp :arguments args
            :wait t
            other-options)
-    ))
+    #+sbcl
+    (apply #'sb-ext:run-program command args
+		  :search t
+		  :wait t
+		  other-options)
+    #+lispworks
+    (apply #'system:run-program  
+	   command
+	   :arguments
+	   args
+	   :wait t
+	   other-options)))
 
 ;;;;; ファイル操作
 
@@ -661,7 +672,7 @@
 ;;; x 中の pkg2 に登録されているシンボル( inherited も含む )
 ;;; を pkg1 に登録し直したものを返す
 (defun immigrate-package (x pkg1 &optional pkg2)
-  (declare (package pkg1))
+  (declare (type (or package string) pkg1))
   (map-all-atoms 
       #'(lambda (xx)
           (if (and (symbolp xx)
@@ -691,7 +702,7 @@
 
 ;;; 登録されているpackgeに依らず，シンボル名が同じがどうかを判定
 (defun symbol= (sym1 sym2)
-  (declare (symbol sym1 sym2))
+  #+nil(declare (symbol sym1 sym2))
   (and
    (symbolp sym1)
    (symbolp sym2)
@@ -1112,7 +1123,7 @@ Returns a list whose Nth element is (cons (nth x) (nth y))"
 
 ;;; treeの全てのatom要素を，fnを適用した結果に置き換えたtreeを生成して返す
 (defun map-all-atoms (fn tree)
-  (declare (function fn) (list tree))
+  (declare (function fn) (type (or list atom) tree))
   (if (atom tree)
       (funcall fn tree)
     (cons (map-all-atoms fn (car tree))
@@ -1226,12 +1237,12 @@ Returns a list whose Nth element is (cons (nth x) (nth y))"
 ;;; memoized function 
 (defun memoize (fn &key
                    (test #'eql)
-                   (size nil size-p)
-                   (rehash-size nil rehash-size-p)
-                   (rehash-threshold nil rehash-threshold-p)
+                   (size 0 size-p)
+                   (rehash-size 0 rehash-size-p)
+                   (rehash-threshold 0 rehash-threshold-p)
                    (use-multiple-values nil)
                    )
-  (declare (function fn test) (integer size rehash-size rehash-threshold)
+  (declare (function fn test) (type integer size rehash-size rehash-threshold)
            (boolean use-multiple-values))
   (let ((cache (apply #'make-hash-table :test test
                       (nconc (when size-p (list :size size))

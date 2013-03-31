@@ -1,1 +1,1 @@
-../../sc-misc.lsp
+/home/jon/github/sc-language-git/src/sc-misc.lsp
