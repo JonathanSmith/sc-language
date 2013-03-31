@@ -1,0 +1,1067 @@
+;;; Copyright (c) 2009 Tasuku Hiraishi <tasuku@media.kyoto-u.ac.jp>
+;;; All rights reserved.
+
+;;; Redistribution and use in source and binary forms, with or without
+;;; modification, are permitted provided that the following conditions
+;;; are met:
+;;; 1. Redistributions of source code must retain the above copyright
+;;;    notice, this list of conditions and the following disclaimer.
+;;; 2. Redistributions in binary form must reproduce the above copyright
+;;;    notice, this list of conditions and the following disclaimer in the
+;;;    documentation and/or other materials provided with the distribution.
+
+;;; THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND
+;;; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+;;; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+;;; ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE
+;;; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+;;; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+;;; OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+;;; HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+;;; LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+;;; OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+;;; SUCH DAMAGE.
+
+;;; Spanning tree
+;;; (Only available on a single node)
+
+;;; How to execute
+;; task 0 0 0 4
+;; <graph-type>   ; 1: random, 2: 2D-torus, 3: hyper-cube, 4:bintree
+;; <algorithm>    ; 1: sequential (search-s2), 2: sequential (search), 3: parallel (search-p), 4: parallel (search-p-array)
+;; <show-graph-p> ; 0: no, 1: show by show-graph, 2: show by show-graph2
+;; <show-tree-p>  ; 0: no, 1: show by show-graph, 2: show by show-graph2
+
+(c-exp "#include<sys/time.h>")
+(c-exp "#include<stdlib.h>")
+(c-exp "#include\"xccmem.h\"")
+
+;;; ワーカごとに処理したタスクの数をカウントして表示
+;; (%defconstant COUNT-NTASK)
+;;; 時々v-listの整合性をチェック
+;; (%defconstant CHECK)
+;;; search1-p での頂点再訪チェックにおけるメモリバリアの方法
+(%ifndef* SEARCH-P-MEM-BARRIER-1
+  (%ifndef* SEARCH-P-MEM-BARRIER-2
+    (%ifndef* SEARCH-P-MEM-BARRIER-3
+      (%defconstant SEARCH-P-MEM-BARRIER-3)))) ; 1 or 2 or 3 (default=3)
+;;; 統計情報をとる
+;; (%defconstant STATISTICS)
+
+(%ifndef* NF-TYPE
+  (%defconstant NF-TYPE GCC)) ; one of (GCC LW-SC CL-SC XCC XCCCL)
+(%include "rule/tcell-setrule.sh")
+
+(%include "clib.sh")
+(%include "dprint.sh")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(def (csym::elapsed-time tp) 
+    (fn double (array (struct timeval) 2))
+  (return (+ (- (fref (aref tp 1) tv-sec)
+                (fref (aref tp 0) tv-sec))
+             (* 0.000001
+                (- (fref (aref tp 1) tv-usec)
+                   (fref (aref tp 0) tv-usec))))))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(%defmacro when (exp &body body)
+  `(if ,exp (begin ,@body)))
+(%defmacro unless (exp &body body)
+  `(when (not ,exp) ,@body))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(%defconstant MAX-V (+ (* 16 1024 1024) 321))
+(%defconstant MAX-E (+ (* 64 1024 1024) 321))
+(%defconstant V-LIST-ALLOC-SIZE 600)
+;;; (%defconstant V-LIST-ALLOC-SIZE 200)
+
+(%ifndef* CALL-BOUND
+  (%defconstant CALL-BOUND 30))
+
+;;;;;;;;;;
+(def V-Length int)                      ; グラフの全頂点数
+
+(def (struct vertex)
+  (def degree int)                      ; 接続している枝の数
+  (def first-e int)                     ; 枝のうちの1つ（残りはnext-eで辿る）
+  (def parent int))                     ; spanning treeの親の頂点ID+1，未定の場合は0，rootは自分自身を指す
+
+(def VV (array (struct vertex) MAX-V))
+
+;;;;;;;;;;
+(def E-Length int)                      ; グラフの全枝数
+
+(def (struct edge)
+  (def next-v int)                      ; 枝が指している頂点
+  (def next-e int))                     ; 次の枝
+
+(def EE (array (struct edge) MAX-E))
+
+;;;;;;;;;;
+;;; list of arrays of vertices
+;;; （作業スタック）
+
+(def (struct v-list-body)
+  (def next (ptr (struct v-list-body)))   ; 次の要素
+  (def i int)                             ; スタックポインタ（(== i V-LIST-ALLOC-SIZE)が底）
+  (def v (array int V-LIST-ALLOC-SIZE)))  ; 頂点IDのリスト
+
+(def V-List-Length int)                 ; v-list-bodyリストの長さ
+(def V-List (ptr (struct v-list-body))) ; v-list-bodyリストの先頭
+
+(def (struct v-list-head)
+  (def first (ptr (struct v-list-body)))
+  (def last (ptr (struct v-list-body)))
+  (def length int))
+
+;;; 並列版ではワーカごとにスタックを持つ
+(def worker-data
+    (%ifdef* COUNT-NTASK
+      (def n-task int))
+  (def V-List (struct v-list-head))
+  )
+
+(decl (csym::alloc-v-list next) (csym::fn (ptr (struct v-list-body)) (ptr (struct v-list-body))))
+
+(def worker-init
+    (%ifdef* COUNT-NTASK
+      (= WDATA.n-task 0))
+  (= WDATA.V-List.first 0)
+  (= WDATA.V-List.last 0)
+  (= WDATA.V-List.length 0)
+  )
+
+;;; 統計情報
+(%ifdef* STATISTICS
+  (%defconstant LOOP-MAX 1000)
+  (def N-Iter int 0)                          ; search[-p[-array]]での反復回数
+  (def V-List-Remain (array int LOOP-MAX))    ; 各反復開始時のリストの長さ
+  (def Visited-Vertices (array int LOOP-MAX)) ; 各反復開始時に訪問済みの頂点数
+  
+  ;; 走査済みの頂点数
+  (def (csym::count-visited-vertices) (csym::fn int void)
+    (def v int)
+    (def n int 0)
+    (for ((= v 0) (< v V-Length) (inc v))
+      (unless (or (< (- (fref (aref VV v) parent) 1) 0)
+                  (>= (- (fref (aref VV v) parent) 1) V-Length))
+        (inc n)))
+    (return n))
+  
+  (def (csym::print-statistics) (csym::fn void void)
+    (def i int)
+    (csym::fprintf stderr "Iterations: %d~%" N-Iter)
+    (for ((= i 0) (< i N-Iter) (inc i))
+      (csym::fprintf stderr "iter(%3d): list-length=%9d         visited=%9d~%"
+                     (+ i 1) (aref V-List-Remain i) (aref Visited-Vertices i))))
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; v-list-bodyを1個push
+;;; lengthの値は別途処理する必要があるので注意
+(def (csym::alloc-v-list next) (csym::fn (ptr (struct v-list-body)) (ptr (struct v-list-body)))
+  (def a (ptr (struct v-list-body)))
+  (= a (cast (ptr (struct v-list-body))
+         (csym::malloc (sizeof (struct v-list-body)))))
+  (= a->next next)
+  (= a->i V-LIST-ALLOC-SIZE)
+  (return a))
+
+;;; v-list-bodyを1個pop
+;;; lengthの値は別途処理する必要があるので注意
+(def (csym::dealloc-v-list a) (csym::fn (ptr (struct v-list-body)) (ptr (struct v-list-body)))
+  (def next (ptr (struct v-list-body)))
+  (= next a->next)
+  (csym::free a)
+  (return next))
+
+;;; （デバッグ用）v-list-lastがv-listの最後かチェック
+(def (csym::check-last v-list v-list-last info)
+    (csym::fn void (ptr (struct v-list-body)) (ptr (struct v-list-body)) (ptr char))
+  (def cur (ptr (struct v-list-body)))
+  (unless v-list (return))
+  (for ((= cur v-list) cur->next (= cur cur->next)))
+  (when (!= cur v-list-last)
+    (csym::fprintf stderr "!! last is incorrect. %s ~%" info)))
+
+;;; （デバッグ用）v-listの長さがlen-expectであるかチェック
+(def (csym::check-length v-list len-expect info) (csym::fn void (ptr (struct v-list-body)) int (ptr char))
+  (def cur (ptr (struct v-list-body)))
+  (def len int 0)
+  (for ((= cur v-list) cur (= cur cur->next))
+    (inc len))
+  (when (!= len len-expect)
+    (csym::fprintf stderr "!! Unexpected length len:%d expect:%d %s~%" len len-expect info)))
+
+;;; （デバッグ用）check-last and check-length
+(def (csym::check-v-list v-list v-list-last len-expect info)
+    (csym::fn void (ptr (struct v-list-body)) (ptr (struct v-list-body)) int (ptr char))
+  (csym::check-length v-list len-expect info)
+  (csym::check-last v-list v-list-last info))
+
+;;; v-list aの後ろにbを連結（破壊的）
+;;; a-lastがわかる場合は与えておくと前からたどらない
+;;; lengthの値は別途処理する必要があるので注意
+(def (csym::nconc-v-list a a-last b)
+    (csym::fn (ptr (struct v-list-body)) (ptr (struct v-list-body)) (ptr (struct v-list-body)) (ptr (struct v-list-body)))
+  (def cur (ptr (struct v-list-body)))
+  (cond
+   (a-last
+    (%ifdef* CHECK (csym::check-last a a-last "in nconc-v-list"))
+    (= a-last->next b)
+    (return a))
+   (a
+    (for ((= cur a) cur->next (= cur cur->next)))
+    (= cur->next b)
+    (return a))
+    (else
+     (return b))))
+
+;;; v-listを配列化
+(def (csym::v-list-to-array buf v-list-first len)
+    (csym::fn void (ptr (ptr (struct v-list-body))) (ptr (struct v-list-body)) int)
+  (def i int)
+  (def v-list-cur (ptr (struct v-list-body)))
+  (for ((exps (= i 0) (= v-list-cur v-list-first))
+        (< i len)
+        (exps (inc i) (= v-list-cur v-list-cur->next)))
+    (= (aref buf i) v-list-cur)))
+
+;;;;;;;;;;
+
+;;; serial DF search with v_list
+;; (%defconstant USE-CAS-IN-SEARCH2 1)
+(def (csym::search-s2 fv) (csym::fn void int)
+  (def my-v-list (ptr (struct v-list-body)))
+  (def my-v-list-length int)            ; 作業中のv-list-body
+  (def vi int)                          ; ローカルなスタックポインタ（(== vi V-LIST-ALLOC-SIZE)が底）
+  (= (fref (aref VV fv) parent) (+ fv 1))
+  (= my-v-list (csym::alloc-v-list 0))
+  (= my-v-list-length 1)
+  (= vi my-v-list->i)
+  (= (aref my-v-list->v (-- vi)) fv)    ; スタックに最初の要素追加
+  (while (< vi V-LIST-ALLOC-SIZE)
+    (def v int (aref my-v-list->v (inc vi))) ; スタックから一要素取り出す
+    (def i int)
+    (def d int (fref (aref VV v) degree))
+    (def e int (fref (aref VV v) first-e))
+    (for ((= i 0) (< i d) (exps (inc i) (= e (fref (aref EE e) next-e))))
+      (def nv int (fref (aref EE e) next-v))
+      (when (== (fref (aref VV nv) parent) 0)
+        (when (%ifdef* USE-CAS-IN-SEARCH2
+                (not (csym::cas-int (fref (aref VV nv) parent) 0 (+ v 1))) ; 枝の先の頂点の親を自分にセット．成功したら0
+                %else
+                1)
+           (%ifndef* USE-CAS-IN-SEARCH2
+             (= (fref (aref VV nv) parent) (+ v 1)))
+           (when (<= vi 0)              ; 配列が一杯になったらv-list-bodyをpush
+             (= my-v-list->i vi)        ; スタックポインタを構造体に反映
+             (= my-v-list (csym::alloc-v-list my-v-list))
+             (inc my-v-list-length)
+             (= vi my-v-list->i))
+           (= (aref my-v-list->v (-- vi)) nv)))) ; 枝の先の頂点をスタックに追加
+    (while (and (== vi V-LIST-ALLOC-SIZE) ; スタックが空になったらv-list-bodyをpop
+                (> my-v-list-length 1))
+      (= my-v-list (csym::dealloc-v-list my-v-list))
+      (dec my-v-list-length)
+      (= vi my-v-list->i)))
+  (= my-v-list->i vi))                  ; スタックポインタを構造体に反映（一応）
+
+;;;;;;;;;;;;;;;;;;;;
+
+;;; recursive DF search with a bound "b" spilling into v_list
+;; (%defconstant USE-CAS-IN-SEARCH1 1)
+(def (csym::search1 v b) (csym::fn void int int)
+  (def i int)
+  (def d int (fref (aref VV v) degree))
+  (def e int (fref (aref VV v) first-e))
+  ;; (DEBUG-PRINT 1 "search1 v:%d b:%d d:%d~%" v b d)
+  ;; うまくdo-manyにできるか？
+  (for ((= i 0) (< i d) (exps (inc i) (= e (fref (aref EE e) next-e))))
+    (def nv int (fref (aref EE e) next-v))
+    ;; (DEBUG-PRINT 1 "nv: %d~%" nv)
+    (when (== (fref (aref VV nv) parent) 0)
+      (when (%ifdef* USE-CAS-IN-SEARCH1
+              (not (csym::cas-int (fref (aref VV nv) parent) 0 (+ v 1))) ; 枝の先の頂点の親を自分にセット．cas-intの値は成功したら0
+              %else
+              1)
+        (%ifndef* USE-CAS-IN-SEARCH1
+          (= (fref (aref VV nv) parent) (+ v 1)))
+        (if (> b 0)
+            (csym::search1 nv (- b 1))
+          (begin
+            (when (<= V-List->i 0)
+              (= V-List (csym::alloc-v-list V-List))
+              (inc V-List-Length))
+            (= (aref V-List->v (-- V-List->i)) nv)))))))
+
+;;; employing DF search1 for each vertex in v_list.
+;;; repeat until the "next" v_list is empty.
+(def (csym::search v) (csym::fn void int)
+  (defs (ptr (struct v-list-body)) my-v-list mlist next)
+  (defs int i j my-v-list-length mlist-length)
+  (DEBUG-PRINT 1 "search v:%d~%" v)
+  (= (fref (aref VV v) parent) (+ v 1))
+  (= V-List (csym::alloc-v-list 0))
+  (= V-List-Length 1)
+  (csym::search1 v CALL-BOUND)
+  (DEBUG-PRINT 1 "V-List-Length: %d~%" V-List-Length)
+  (do-while (or (> V-List-Length 1)
+                (< V-List->i V-LIST-ALLOC-SIZE))
+    ;; V-Listをmy-v-listに移す
+    (= my-v-list V-List) (= mlist my-v-list)
+    (= my-v-list-length V-List-Length) (= mlist-length my-v-list-length)
+    (= V-List (csym::alloc-v-list 0))
+    (= V-List-Length 1)
+    (for ((= i 0) (< i my-v-list-length) (exps (inc i) (= my-v-list my-v-list->next)))
+      (for ((= j  my-v-list->i) (< j V-LIST-ALLOC-SIZE) (inc j))
+        (csym::search1 (aref my-v-list->v j) CALL-BOUND)))
+    (for ((= i 0) (< i mlist-length) (inc i))
+      (= mlist (csym::dealloc-v-list mlist)))
+    (DEBUG-PRINT 1 "V-List-Length: %d~%" V-List-Length)
+    ))
+
+;;;;;;;;;;
+;;; Parallel version
+(decl (search1-p v b k0 k1) (wfn void int int int int))
+(decl (search-p-b my-v-list i0 i1) (wfn void (ptr (struct v-list-body)) int int))
+(decl (search-p-b-array my-v-array i0 i1) (wfn void (ptr (ptr (struct v-list-body))) int int))
+(decl (search-p-c my-v-list j0 j1) (wfn void (ptr (struct v-list-body)) int int))
+
+;;; parallel version of search1
+(def (task t-search1)
+  (def v int :in)
+  (def b int :in)
+  (def k0 int :in)
+  (def k1 int :in)
+  (def v-list (struct v-list-head) :out)
+  )
+;;
+(def (task-body t-search1)
+    (%ifdef* COUNT-NTASK
+      (++ WDATA.n-task)
+      (DEBUG-PRINT 1 "Worker %d starts %d-th task (t-search1)~%" WORKER-ID WDATA.n-task))
+  (def stack-created-p int 0)
+  (unless WDATA.V-List.first
+    ;; WDATA.V-Listを初期化
+    (= WDATA.V-List.first (csym::alloc-v-list 0))
+    (= WDATA.V-List.length 1)
+    (= WDATA.V-List.last WDATA.V-List.first)
+    (= stack-created-p 1))
+  (search1-p this.v this.b this.k0 this.k1)
+  (%ifdef* CHECK (csym::check-v-list WDATA.V-List.first WDATA.V-List.last WDATA.V-List.length "in task-body t-search1"))
+  ;;
+  (if stack-created-p
+      (begin
+        (if (or (> WDATA.V-List.length 1)
+                (< WDATA.V-List.first->i V-LIST-ALLOC-SIZE))
+            (begin
+              (= this.v-list.first WDATA.V-List.first)
+              (= this.v-list.last WDATA.V-List.last)
+              (= this.v-list.length WDATA.V-List.length))
+          (begin
+            (csym::dealloc-v-list WDATA.V-List.first)
+            (= this.v-list.first 0)
+            (= this.v-list.last 0)
+            (= this.v-list.length 0)))
+        (= WDATA.V-List.first 0)
+        (= WDATA.V-List.last 0)
+        (= WDATA.V-List.length 0))
+    (begin
+      (= this.v-list.first 0)
+      (= this.v-list.last 0)
+      (= this.v-list.length 0)))
+  )
+;;
+(%ifdef* SEARCH-P-MEM-BARRIER-1
+  (%defmacro DUP-CHECK (&body body)
+    `(unless (csym::cas-int (fref (aref VV nv) parent) 0 (+ v 1)) ; 成功したら0
+       (csym::start_access_after_lock)
+       ,@body))
+  %else
+  (%ifdef* SEARCH-P-MEM-BARRIER-2
+    (%defmacro DUP-CHECK (&body body)
+      `(when (== (csym::atomic-read-int-to-finish-write (fref (aref VV nv) parent)) 0)
+         (csym::atomic-write-int (fref (aref VV nv) parent) (+ v 1))
+         ,@body))
+    %else
+    ;; (%ifdef* SEARCH-P-MEM-BARRIER-3
+    (%defmacro DUP-CHECK (&body body)
+      `(when (== (csym::atomic-read-int (fref (aref VV nv) parent)) 0)
+         (csym::atomic-write-int-to-start-read (fref (aref VV nv) parent) (+ v 1))
+         ,@body))
+    ))
+
+(def (search1-p v b k0 k1) (wfn void int int int int)
+  (def i int)
+  (def e int (fref (aref VV v) first-e))
+  (def nv int)
+  ;; (DEBUG-PRINT 1 "[%2d] search1-p v:%d b:%d %d %d~%" WORKER-ID v b k0 k1)
+  (for ((= i 0) (< i k0) (inc i))
+    (= e (fref (aref EE e) next-e)))
+  (do-many for i from k0 to k1
+    (= nv (fref (aref EE e) next-v))
+    (DUP-CHECK
+     (if (> b 0)                        ; boundaryに達していなければ深さ優先
+         (search1-p nv (- b 1) 0 (fref (aref VV nv) degree))
+       (begin                           ; boundaryに達していればスタックに積んで幅優先
+         (when (<= WDATA.V-List.first->i 0)
+           (= WDATA.V-List.first (csym::alloc-v-list WDATA.V-List.first))
+           (inc WDATA.V-List.length)
+           (%ifdef* CHECK (csym::check-v-list WDATA.V-List.first WDATA.V-List.last WDATA.V-List.length "in search1-p"))
+           )
+         (= (aref WDATA.V-List.first->v (-- WDATA.V-List.first->i)) nv))))
+    (= e (fref (aref EE e) next-e))
+    (t-search1
+     (:put from k0-2 to k1-2
+           (= this.v v)  (= this.b b)
+           (= this.k0 k0-2) (= this.k1 k1-2))
+     (:get (%ifdef* CHECK (csym::check-length WDATA.V-List.first WDATA.V-List.length "in search-p :get (WDATA)"))
+           (%ifdef* CHECK (csym::check-length this.v-list.first this.v-list.length "in search-p :get (this)"))
+           (= WDATA.V-List.first (csym::nconc-v-list this.v-list.first this.v-list.last WDATA.V-List.first))
+           (+= WDATA.V-List.length this.v-list.length)
+           (%ifdef* CHECK (csym::check-v-list WDATA.V-List.first WDATA.V-List.last WDATA.V-List.length
+                                             "in search-p :get (nconc)"))
+           ))
+     ))
+
+;;; parallel version of search
+(def (search-p v) (wfn void int)
+  (defs (struct v-list-head) my-v-list mlist) ; my-v-list：1反復で処理するリスト，mlist：m-v-list解放用
+  (def i int)
+  (DEBUG-PRINT 1 "[%2d] search-p v:%d~%" WORKER-ID v)
+  (= (fref (aref VV v) parent) (+ v 1))
+  ;; WDATA.V-Listを初期化
+  (= WDATA.V-List.first (csym::alloc-v-list 0))
+  (= WDATA.V-List.length 1)
+  (= WDATA.V-List.last WDATA.V-List.first)
+  ;; 始点から深さ制限つきDF search
+  (search1-p v CALL-BOUND 0 (fref (aref VV v) degree))
+  (DEBUG-PRINT 1 "V-List-Length: %d~%" WDATA.V-List.length)
+  (while (or (> WDATA.V-List.length 1)
+             (< WDATA.V-List.first->i V-LIST-ALLOC-SIZE))
+    ;; 統計
+    (%ifdef* STATISTICS
+      (= (aref V-List-Remain N-Iter) WDATA.V-List.length)
+      (= (aref Visited-Vertices N-Iter) (csym::count-visited-vertices))
+      (inc N-Iter))
+    ;; WDATA.V-Listをmy-v-listに移す
+    (= my-v-list WDATA.V-List) (= mlist my-v-list)
+    ;; WDATA.V-Listを初期化
+    (= WDATA.V-List.first (csym::alloc-v-list 0))
+    (= WDATA.V-List.length 1)
+    (= WDATA.V-List.last WDATA.V-List.first)
+    ;; my-v-listを処理
+    (DEBUG-PRINT 1 "my-v-list-length: %d~%" my-v-list.length)
+    (%ifdef* CHECK (csym::check-length my-v-list.first my-v-list.length "in search-p"))
+    (search-p-b my-v-list.first 0 my-v-list.length)
+    ;; 処理済みのmy-v-listを解放
+    (for ((= i 0) (< i mlist.length) (inc i))
+      (= mlist.first (csym::dealloc-v-list mlist.first)))
+    )
+  (DEBUG-PRINT 1 "search-p finishing.~%")
+  )
+;;;
+(def (task t-search-b)
+  (def my-v-list-first (ptr (struct v-list-body)) :in)
+  (def i0 int :in)
+  (def i1 int :in)
+  (def v-list (struct v-list-head) :out)
+  )
+;;
+(def (task-body t-search-b)
+    (%ifdef* COUNT-NTASK
+      (++ WDATA.n-task)
+      (DEBUG-PRINT 1 "Worker %d starts %d-th task (t-search-b)~%" WORKER-ID WDATA.n-task))
+  (def stack-created-p int 0)
+  (unless WDATA.V-List.first
+    ;; WDATA.V-Listを初期化
+    (= WDATA.V-List.first (csym::alloc-v-list 0))
+    (= WDATA.V-List.length 1)
+    (= WDATA.V-List.last WDATA.V-List.first)
+    (= stack-created-p 1))
+  (search-p-b this.my-v-list-first this.i0 this.i1)
+  (%ifdef* CHECK (csym::check-v-list WDATA.V-List.first WDATA.V-List.last WDATA.V-List.length "in task-body t-search-b"))
+  ;;
+  (if stack-created-p
+      (begin
+        (if (or (> WDATA.V-List.length 1)
+                (< WDATA.V-List.first->i V-LIST-ALLOC-SIZE))
+            (begin
+              (= this.v-list.first WDATA.V-List.first)
+              (= this.v-list.last WDATA.V-List.last)
+              (= this.v-list.length WDATA.V-List.length))
+          (begin
+            (csym::dealloc-v-list WDATA.V-List.first)
+            (= this.v-list.first 0)
+            (= this.v-list.last 0)
+            (= this.v-list.length 0)))
+        (= WDATA.V-List.first 0)
+        (= WDATA.V-List.last 0)
+        (= WDATA.V-List.length 0))
+    (begin
+      (= this.v-list.first 0)
+      (= this.v-list.last 0)
+      (= this.v-list.length 0)))
+  )
+;;
+(def (search-p-b my-v-list-first i0 i1) (wfn void (ptr (struct v-list-body)) int int)
+  (def i int)
+  (def my-v-list-first0 (ptr (struct v-list-body)))
+  (DEBUG-PRINT 1 "[%2d] search-p-b %p %d %d~%" WORKER-ID my-v-list-first i0 i1)
+  (for ((= i 0) (< i i0) (inc i))
+    (= my-v-list-first my-v-list-first->next))
+  (-= i1 i0) (= i0 0)
+  (= my-v-list-first0 my-v-list-first)
+  (do-many for i from i0 to i1
+    (search-p-c my-v-list-first my-v-list-first->i V-LIST-ALLOC-SIZE)
+    (= my-v-list-first my-v-list-first->next)
+    (t-search-b                           ; my-v-list0の i0-2〜i1-2 の範囲を渡す
+     (:put from i0-2 to i1-2
+           (= this.my-v-list-first my-v-list-first0)
+           (= this.i0 i0-2) (= this.i1 i1-2))
+     (:get (%ifdef* CHECK (csym::check-length WDATA.V-List.first WDATA.V-List.length "in search-p-b :get (WDATA)"))
+           (%ifdef* CHECK (csym::check-length this.v-list.first this.v-list.length "in search-p-b :get (this)"))
+           (= WDATA.V-List.first (csym::nconc-v-list this.v-list.first this.v-list.last WDATA.V-List.first))
+           (+= WDATA.V-List.length this.v-list.length)
+           (%ifdef* CHECK (csym::check-v-list WDATA.V-List.first WDATA.V-List.last WDATA.V-List.length
+                                             "in search-p-b :get (nconc)"))
+           ))
+    ))
+;;; list2array version of search-p
+(def (search-p-array v) (wfn void int)
+  (def my-v-array (ptr (ptr (struct v-list-body)))) ; my-v-list：1反復で処理する頂点スタック配列
+  (def my-v-array-length int)
+  (def buf-size int)
+  (def i int)
+  (DEBUG-PRINT 1 "[%2d] search-p-array v:%d~%" WORKER-ID v)
+  (= (fref (aref VV v) parent) (+ v 1))
+  ;; WDATA.V-Listを初期化
+  (= WDATA.V-List.first (csym::alloc-v-list 0))
+  (= WDATA.V-List.length 1)
+  (= WDATA.V-List.last WDATA.V-List.first)
+  ;; 始点から深さ制限つきDF search
+  (search1-p v CALL-BOUND 0 (fref (aref VV v) degree))
+  (DEBUG-PRINT 1 "V-List-Length: %d~%" WDATA.V-List.length)
+  (= my-v-array 0) (= buf-size 0)
+  (while (or (> WDATA.V-List.length 1)
+                (< WDATA.V-List.first->i V-LIST-ALLOC-SIZE))
+    ;; 統計
+    (%ifdef* STATISTICS
+      (= (aref V-List-Remain N-Iter) WDATA.V-List.length)
+      (= (aref Visited-Vertices N-Iter) (csym::count-visited-vertices))
+      (inc N-Iter)
+      )
+    ;; WDATA.V-Listを配列化
+    (= my-v-array-length WDATA.V-List.length)
+    (when (> my-v-array-length buf-size)
+      (= buf-size (* 2 my-v-array-length))
+      (= my-v-array (cast (ptr (ptr (struct v-list-body)))
+                      (csym::realloc my-v-array (* buf-size (sizeof (ptr (struct v-list-body))))))))
+    (csym::v-list-to-array my-v-array WDATA.V-List.first WDATA.V-List.length)
+    ;; WDATA.V-Listを初期化
+    (= WDATA.V-List.first (csym::alloc-v-list 0))
+    (= WDATA.V-List.length 1)
+    (= WDATA.V-List.last WDATA.V-List.first)
+    ;; my-v-arrayを処理
+    (search-p-b-array my-v-array 0 my-v-array-length)
+    ;; 処理済みのmy-v-arrayを解放
+    (for ((= i 0) (< i my-v-array-length) (inc i))
+      (csym::dealloc-v-list (aref my-v-array i)))
+    )
+  (csym::free my-v-array)
+  (DEBUG-PRINT 1 "search-p finishing.~%")
+  )
+;;;
+(def (task t-search-b-array)
+  (def my-v-array (ptr (ptr (struct v-list-body))) :in)
+  (def i0 int :in)
+  (def i1 int :in)
+  (def v-list (struct v-list-head) :out)
+  )
+;;
+(def (task-body t-search-b-array)
+    (%ifdef* COUNT-NTASK
+      (++ WDATA.n-task)
+      (DEBUG-PRINT 1 "Worker %d starts %d-th task (t-search-b-array)~%" WORKER-ID WDATA.n-task))
+  (def stack-created-p int 0)
+  (unless WDATA.V-List.first
+    ;; WDATA.V-Listを初期化
+    (= WDATA.V-List.first (csym::alloc-v-list 0))
+    (= WDATA.V-List.length 1)
+    (= WDATA.V-List.last WDATA.V-List.first)
+    (= stack-created-p 1))
+  (search-p-b-array this.my-v-array this.i0 this.i1)
+  (%ifdef* CHECK (csym::check-v-list WDATA.V-List.first WDATA.V-List.last WDATA.V-List.length
+                                     "in task-body t-search-b-array"))
+  ;;
+  (if stack-created-p
+      (begin
+        (if (or (> WDATA.V-List.length 1)
+                (< WDATA.V-List.first->i V-LIST-ALLOC-SIZE))
+            (begin
+              (= this.v-list.first WDATA.V-List.first)
+              (= this.v-list.last WDATA.V-List.last)
+              (= this.v-list.length WDATA.V-List.length))
+          (begin
+            (csym::dealloc-v-list WDATA.V-List.first)
+            (= this.v-list.first 0)
+            (= this.v-list.last 0)
+            (= this.v-list.length 0)))
+        (= WDATA.V-List.first 0)
+        (= WDATA.V-List.last 0)
+        (= WDATA.V-List.length 0))
+    (begin
+      (= this.v-list.first 0)
+      (= this.v-list.last 0)
+      (= this.v-list.length 0)))
+  )
+;;
+(def (search-p-b-array my-v-array i0 i1) (wfn void (ptr (ptr (struct v-list-body))) int int)
+  (def i int)
+  (DEBUG-PRINT 1 "[%2d] search-p-b-array %p %d %d~%" WORKER-ID my-v-array i0 i1)
+  (do-many for i from i0 to i1
+    (search-p-c (aref my-v-array i) (fref (aref my-v-array i) -> i) V-LIST-ALLOC-SIZE)
+    (t-search-b-array                   ; my-v-arrayの i0-2〜i1-2 の範囲を渡す
+     (:put from i0-2 to i1-2
+           (= this.my-v-array my-v-array)
+           (= this.i0 i0-2) (= this.i1 i1-2))
+     (:get (%ifdef* CHECK (csym::check-length WDATA.V-List.first WDATA.V-List.length "in search-p-b-array :get (WDATA)"))
+        
+           
+           (%ifdef* CHECK (csym::check-length this.v-list.first this.v-list.length "in search-p-b-array :get (this)"))
+           (= WDATA.V-List.first (csym::nconc-v-list this.v-list.first this.v-list.last WDATA.V-List.first))
+           (+= WDATA.V-List.length this.v-list.length)
+           (%ifdef* CHECK (csym::check-v-list WDATA.V-List.first WDATA.V-List.last WDATA.V-List.length
+                                             "in search-p-b-array :get (nconc)"))
+           ))
+    ))
+;;;
+(def (task t-search-c)
+  (def my-v-list-cur (ptr (struct v-list-body)) :in)
+  (def j0 int :in)
+  (def j1 int :in)
+  (def v-list (struct v-list-head) :out)
+  )
+;;
+(def (task-body t-search-c)
+    (%ifdef* COUNT-NTASK
+      (++ WDATA.n-task)
+      (DEBUG-PRINT 1 "Worker %d starts %d-th task (t-search-c)~%" WORKER-ID WDATA.n-task))
+  (def stack-created-p int 0)
+  (unless WDATA.V-List.first
+    ;; WDATA.V-Listを初期化
+    (= WDATA.V-List.first (csym::alloc-v-list 0))
+    (= WDATA.V-List.length 1)
+    (= WDATA.V-List.last WDATA.V-List.first)
+    (= stack-created-p 1))
+  (search-p-c this.my-v-list-cur this.j0 this.j1)
+  (%ifdef* CHECK (csym::check-v-list WDATA.V-List.first WDATA.V-List.last WDATA.V-List.length "in task-body t-search-c"))
+  ;; 
+  (if stack-created-p
+      (begin
+        (if (or (> WDATA.V-List.length 1)
+                (< WDATA.V-List.first->i V-LIST-ALLOC-SIZE))
+            (begin
+              (= this.v-list.first WDATA.V-List.first)
+              (= this.v-list.last WDATA.V-List.last)
+              (= this.v-list.length WDATA.V-List.length))
+          (begin
+            (csym::dealloc-v-list WDATA.V-List.first)
+            (= this.v-list.first 0)
+            (= this.v-list.last 0)
+            (= this.v-list.length 0)))
+        (= WDATA.V-List.first 0)
+        (= WDATA.V-List.last 0)
+        (= WDATA.V-List.length 0))
+    (begin
+      (= this.v-list.first 0)
+      (= this.v-list.last 0)
+      (= this.v-list.length 0)))
+  )
+;;;
+(def (search-p-c my-v-list-cur j0 j1) (wfn void (ptr (struct v-list-body)) int int)
+  (def j int)
+  (DEBUG-PRINT 1 "[%2d] search-p-c %p %d %d~%" WORKER-ID my-v-list-cur j0 j1)
+  (do-many for j from j0 to j1
+    (search1-p (aref my-v-list-cur->v j) CALL-BOUND 0 (fref (aref VV (aref my-v-list-cur->v j)) degree))
+    (t-search-c
+     (:put from j0-2 to j1-2
+           (= this.my-v-list-cur my-v-list-cur)
+           (= this.j0 j0-2) (= this.j1 j1-2))
+     (:get (%ifdef* CHECK (csym::check-length WDATA.V-List.first WDATA.V-List.length "in search-p-c :get (WDATA)"))
+           (%ifdef* CHECK (csym::check-length this.v-list.first this.v-list.length "in search-p-c :get (this)"))
+           (= WDATA.V-List.first (csym::nconc-v-list this.v-list.first this.v-list.last WDATA.V-List.first))
+           (+= WDATA.V-List.length this.v-list.length)
+           (%ifdef* CHECK (csym::check-v-list WDATA.V-List.first WDATA.V-List.last WDATA.V-List.length
+                                             "in search-p-c :get (nconc)"))
+           ))
+    ))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;; for graph construction
+;;; v1->v2の枝を作ってeの位置に格納．返り値は次の枝の格納場所
+(def (csym::make-edge1 v1 v2 e) (csym::fn int int int int)
+  (= (fref (aref EE e) next-v) v2)
+  (= (fref (aref EE e) next-e) (fref (aref VV v1) first-e))
+  (= (fref (aref VV v1) first-e) (inc e)) ; v1の枝リストにpush
+  (inc (fref (aref VV v1) degree))
+  (return e))
+
+;;; v1->v2の枝があれば1，そうでなければ0を返す
+(def (csym::check-dup1 v1 v2) (csym::fn int int int)
+  (def i int)
+  (def d int (fref (aref VV v1) degree))
+  (def e int (fref (aref VV v1) first-e))
+  (for ((= i 0) (< i d) (exps (inc i) (= e (fref (aref EE e) next-e))))
+    (def nv int (fref (aref EE e) next-v))
+    (when (== nv v2)
+      (return 0)))
+  (return 1))
+
+;;; v1->v2の枝がなければ作る．返り値は次の枝の格納場所
+(def (csym::check-make-edge1 v1 v2 e) (csym::fn int int int int)
+  (when (csym::check-dup1 v1 v2)
+    (= e (csym::make-edge1 v1 v2 e)))
+  (return e))
+
+;;; v1<->v2の両方向の枝を作る．返り値は次の枝の格納場所
+(def (csym::make-edge v1 v2 e) (csym::fn int int int int)
+  (= e (csym::make-edge1 v1 v2 e))
+  (= e (csym::make-edge1 v2 v1 e))
+  (return e))
+
+;;; v1<->v2の両方向の枝を，既に枝がないかそれぞれ確認してから作る．
+;;; 返り値は次の枝の格納場所
+(def (csym::check-make-edge v1 v2 e) (csym::fn int int int int)
+  (= e (csym::check-make-edge1 v1 v2 e))
+  (= e (csym::check-make-edge1 v2 v1 e))
+  (return e))
+
+;;;;;;;;;;
+
+;;; binary tree
+(def (csym::make-bintree depth) (csym::fn void int)
+  (def n int (- (<< 1 depth) 1))
+  (def next unsigned-long depth)
+  (defs int i e)
+  (csym::fprintf stderr "Depth %d binary tree (%d vertices)~%" depth n)
+  (for ((= i 0) (< i n) (inc i))
+    (= (fref (aref VV i) degree) 0)
+    (= (fref (aref VV i) first-e) 0)
+    (= (fref (aref VV i) parent) 0))
+  (= e 0)
+  (for ((= i 0) (< i n) (inc i))
+    (if 1
+        (begin
+          ;; employing pseudo randomness
+          (def v (array int 3))
+          (defs int p q n-e)
+          (cond
+           ((== i 0)
+            (= n-e 2)
+            (= (aref v 0) (+ (* i 2) 1))
+            (= (aref v 1) (+ (* i 2) 2)))
+           ((< i (/ (- n 1) 2))
+            (= n-e 3)
+          (= (aref v 0) (/ (- i 1) 2))
+          (= (aref v 1) (+ (* i 2) 1))
+          (= (aref v 2) (+ (* i 2) 2)))
+           (else
+            (= n-e 1)
+            (= (aref v 0) (/ (- i 1) 2))))
+          (= next (+ (* next 1103515245) 12345))
+          (for ((= q n-e) (> q 0) (dec q))
+            (= next (+ (* next 1103515245) 12345))
+            (= p (/ (* q (% (/ next 65536) 32768)) 32768)) ; q未満の乱数
+            (= e (csym::check-make-edge1 i (aref v p) e))
+            (= (aref v p) (aref v (- q 1)))))
+      ;; without pseudo randomness, some unfair preference exists.
+      (if (> i 0)
+          (= e (csym::make-edge i (/ (- i 1) 2) e)))
+      ))
+  (= V-Length n)
+  (= E-Length e))
+
+;;; 2D-torus
+(def (csym::make-2dt n) (csym::fn void int)
+  (defs int ix iy e)
+  (def next unsigned-long n)
+  (csym::fprintf stderr "%dx%d nodes 2D torus~%" n n)
+  (for ((= ix 0) (< ix n) (inc ix))
+    (for ((= iy 0) (< iy n) (inc iy))
+      (def k int (+ (* ix n) iy))
+      (= (fref (aref VV k) degree) 0)
+      (= (fref (aref VV k) first-e) 0)
+      (= (fref (aref VV k) parent) 0)))
+  (= e 0)
+  (for ((= ix 0) (< ix n) (inc ix))
+    (for ((= iy 0) (< iy n) (inc iy))
+      (def k int (+ (* ix n) iy))
+      (def px int (- ix 1))
+      (def py int (- iy 1))
+      (def sx int (+ ix 1))
+      (def sy int (+ iy 1))
+      (when (< px 0) (+= px n))
+      (when (< py 0) (+= py n))
+      (when (>= sx n) (-= sx n))
+      (when (>= sy n) (-= sy n))
+      (%if* 1
+        ;; employing pseudo randomness
+        (begin
+          (def v (array int 4))
+          (defs int p q)
+          (= (aref v 0) (+ (* ix n) py))
+          (= (aref v 1) (+ (* px n) iy))
+          (= (aref v 2) (+ (* ix n) sy))
+          (= (aref v 3) (+ (* sx n) iy))
+          (= next (+ (* next 1103515245) 12345))
+          (for ((= q 4) (> q 0) (-- q))
+            (= next (+ (* next 1103515245) 12345))
+            (= p (/ (* q (% (/ next 65536) 32768)) 32768))
+            (= e (csym::check-make-edge1 k (aref v p) e))
+            (= (aref v p) (aref v (- q 1)))))
+        %else
+        ;; without pseudo randomness, some unfair preference exists.
+        ;; for s2
+        (begin
+          (= e (csym::make-edge (+ (* ix n) iy) (+ (* ix n) sy) e))
+          (= e (csym::make-edge (+ (* ix n) iy) (+ (* sx n) iy) e)))
+        ;; for calldfs
+        ;; (begin
+        ;;   (= e (csym::make-edge (+ (* ix n) iy) (+ (* sx n) iy) e))
+        ;;   (= e (csym::make-edge (+ (* ix n) iy) (+ (* ix n) sy) e)))
+          )))
+  (= V-Length (* n n))
+  (= E-Length e))
+
+;;; hyper-cube
+(def (csym::make-ncube n) (csym::fn void int)
+  (defs int i j (s (<< 1 n)) (e 0))
+  (def next unsigned-long n)
+  (csym::fprintf stderr "%d-D hypercube~%" n n)
+  (for ((= i 0) (< i s) (inc i))
+    (= (fref (aref VV i) degree) 0)
+    (= (fref (aref VV i) first-e) 0)
+    (= (fref (aref VV i) parent) 0))
+  (for ((= i 0) (< i s) (inc i))
+    (%if* 1
+      (defs int p q)
+      (def v (ptr int) (cast (ptr int) (csym::malloc (* n (sizeof int)))))
+      (for ((= j 0) (< j n) (inc j))
+        (= (aref v j) (bit-xor i (<< 1 j))))
+      (= next (+ (* next 1103515245) 12345))
+      (for ((= q n) (> q 0) (-- q))
+        (= next (+ (* next 1103515245) 12345))
+        (= p (/ (* q (% (/ next 65536) 32768)) 32768))
+        (= e (csym::make-edge1 i (aref v p) e))
+        (= (aref v p) (aref v (- q 1))))
+      (csym::free v)
+      %else
+      (for ((= j 0) (< j n) (inc j))
+        (%if* 1
+          (def b int (<< 1 j))
+          %else
+          (def b int (<< 1 (- n 1 j))))
+        (= e (csym::make-edge1 1 (bit-xor i b) e))))
+    )
+  (= V-Length s)
+  (= E-Length e))
+
+;;; random or Greiner93
+(def (csym::make-random n m) (csym::fn void int int)
+  (defs int i j (e 0))
+  (def next unsigned-long (+ n m))
+  (csym::fprintf stderr "%d nodes random (%d edges per node)~%" n m)
+  (for ((= i 0) (< i n) (inc i))
+    (= (fref (aref VV i) degree) 0)
+    (= (fref (aref VV i) first-e) 0)
+    (= (fref (aref VV i) parent) 0))
+  (for ((= i 0) (< i n) (inc i))
+    (= next (+ (* next 1103515245) 12345))
+    (for ((= j 0) (< j m) (inc j))
+      (def v int)
+      (= next (+ (* next 1103515245) 12345))
+      (= v (/ (* n (% (/ next 65536) 32768)) 32768))
+      (= e (csym::check-make-edge i v e))))
+  (= V-Length n)
+  (= E-Length e))
+
+;;;;;;;;;;
+
+;;; graph utils
+;;; "頂点番号[親の頂点番号] (接続されている頂点番号のリスト)" を出力
+(def (csym::show-graph) (csym::fn void)
+  (defs int v e i)
+  (for ((= v 0) (< v V-Length) (inc v))
+    (csym::fprintf stderr "%9d[%d] (" v (- (fref (aref VV v) parent) 1))
+    (begin
+      (def d int (fref (aref VV v) degree))
+      (def e int (fref (aref VV v) first-e))
+      (when (> d 0)
+        (csym::fprintf stderr "%d" (fref (aref EE e) next-v))
+        (= e (fref (aref EE e) next-e))
+        (for ((= i 1) (< i d) (exps (inc i) (= e (fref (aref EE e) next-e))))
+          (csym::fprintf stderr ",%d" (fref (aref EE e) next-v)))))
+    (csym::fprintf stderr ")~%")))
+
+;;; 単純に頂点と枝の情報のリストを出力
+(def (csym::show-graph2) (csym::fn void)
+  (defs int v e i)
+  (for ((= v 0) (< v V-Length) (inc v))
+    (csym::fprintf stderr "%9d[%d] e: %d~%" v (fref (aref VV v) degree) (fref (aref VV v) first-e)))
+  (for ((= e 0) (< e E-Length) (inc e))
+    (csym::fprintf stderr "%9d => %d -> e: %d~%" e (fref (aref EE e) next-v) (fref (aref EE e) next-e))))
+
+(def (csym::dump-graph name file) (csym::fn void (ptr char) (ptr char))
+  (defs int v e)
+  (def fp (ptr FILE))
+  (= fp (csym::fopen file "w"))
+  ;; グラフ名
+  ;; "vertex"
+  ;; # of vertex
+  ;; degree first-e
+  ;; ...
+  ;; "edge"
+  ;; # of edges
+  ;; next-v next-e
+  ;; ...
+  (csym::fprintf fp "%s~%" name)
+  (csym::fprintf fp "vertex~%")
+  (csym::fprintf fp "%d~%" V-Length)
+  (for ((= v 0) (< v V-Length) (inc v))
+    (csym::fprintf fp "%d %d~%" (fref (aref VV v) degree) (fref (aref VV v) first-e)))
+  (csym::fprintf fp "edge~%")
+  (csym::fprintf fp "%d~%" E-Length)
+  (for ((= e 0) (< e E-Length) (inc e))
+    (csym::fprintf fp "%d %d~%" (fref (aref EE e) next-v) (fref (aref EE e) next-e)))
+  (csym::fclose fp)
+  (csym::fprintf stderr "Graph \"%s\" successfully dumped.~%" name)
+  (return))
+
+(def (csym::expect-int str expct n) (csym::fn void (ptr char) int int)
+  (if (!= expct n)
+      (begin
+        (csym::fprintf stderr "%s: expectes %d but %d" str expct n)
+        (csym::exit -1)))
+  (return))
+
+(def (csym::read-graph file) (csym::fn void (ptr char))
+  (defs int v e)
+  (def name (array char 1024))
+  (def str (array char 1024))
+  (def fp (ptr FILE))
+  (= fp (csym::fopen file "r"))
+  (csym::expect-int "fscanf" 1 (csym::fscanf fp "%s" name))
+  (csym::expect-int "fscanf" 1 (csym::fscanf fp "%s" str))
+  (if (not (== (aref str 0) #\v)) ; expects "vertex"
+      (begin
+        (csym::fprintf stderr "File format error~%")
+        (csym::exit -1)))
+  (csym::expect-int "fscanf" 1 (csym::fscanf fp "%d" (ptr V-Length)))
+  (for ((= v 0) (< v V-Length) (inc v))
+    (= (fref (aref VV v) parent) 0)
+    (csym::expect-int
+     "fscanf" 2
+     (csym::fscanf fp "%d %d" (ptr (fref (aref VV v) degree)) (ptr (fref (aref VV v) first-e)))))
+  (csym::expect-int "fscanf" 1 (csym::fscanf fp "%s" str))
+  (if (not (== (aref str 0) #\e)) ; expects "edge"
+      (begin
+        (csym::fprintf stderr "File format error~%")
+        (csym::exit -1)))
+  (csym::expect-int "fscanf" 1 (csym::fscanf fp "%d" (ptr E-Length)))
+  (for ((= e 0) (< e E-Length) (inc e))
+    (csym::expect-int
+     "fscanf" 2
+     (csym::fscanf fp "%d %d" (ptr (fref (aref EE e) next-v)) (ptr (fref (aref EE e) next-e)))))
+  (csym::fclose fp)
+  (csym::fprintf stderr "Graph \"%s\" successfully loaded.~%" name)
+  (return))
+
+
+;;; parentの値が想定外のものになっていないかチェック
+(def (csym::check-graph) (csym::fn void)
+  (def v int)
+  (for ((= v 0) (< v V-Length) (inc v))
+    (when (or (< (- (fref (aref VV v) parent) 1) 0)
+              (>= (- (fref (aref VV v) parent) 1) V-Length))
+      (csym::fprintf stderr "!! %9d[%d]~%" v (- (fref (aref VV v) parent) 1)))))
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(def (task spanning-start)
+  (def graph int :in)                   ; 1: random, 2: 2D-torus, 3: hyper-cube, 4:bintree
+;;  (def gparam int :in)                  ; parameter of graph (e.g., size)
+  (def algorithm int :in)               ; 1: sequential (search-s2), 2: sequential (search),
+                                        ; 3: parallel (search-p), 4: parallel (search-p-array)
+  (def show-graph-p int :in)            ; 0: no, 1: show by show-graph, 2: show by show-graph2
+  (def show-tree-p int :in)             ; 0: no, 1: show by show-graph, 2: show by show-graph2
+  )
+
+(def (task-body spanning-start)
+  (def tp (array (struct timeval) 2))
+  (def algstr (ptr char))
+  (def gname (ptr char))
+  
+  (%ifdef* COUNT-NTASK
+    (++ WDATA.n-task)
+    (DEBUG-PRINT 1 "Worker %d starts %d-th task.~%" WORKER-ID WDATA.n-task))
+  (csym::fprintf stderr "CALL-BOUND: %d~%" CALL-BOUND)
+  (csym::fprintf stderr "BARRIER: %s~%"
+                 (%ifdef* SEARCH-P-MEM-BARRIER-1
+                   "type 1 (cas)"
+                   %else
+                   (%ifdef* SEARCH-P-MEM-BARRIER-2
+                     "type 2 (atomic_read_to_finish_write->atomic_write)"
+                     %else
+                     "type 3 (atomic_read->atomic_write_to_start_read)")))
+  
+  ;; constructing graph
+  (csym::gettimeofday tp 0)
+  (switch this.graph
+    (case 1) (csym::make-random (* 2000 2000) 2)   (= gname "Random4000000.graph") (break)
+    (case 2) (csym::make-2dt 2000)                 (= gname "2DTorus.graph") (break)
+    (case 3) (csym::make-ncube 20)                 (= gname "HCube20.graph") (break)
+    (case 4) (csym::make-bintree 24)               (= gname "Bintree24.graph") (break)
+    (case 5) (csym::make-ncube 21)                 (= gname "HCube21.graph") (break)
+    (case 6) (csym::make-2dt 4000)                 (= gname "2DTorus-4000.graph") (break)
+    (case 11) (= gname "Random4000000.graph") (csym::read-graph gname) (break)
+    (default)
+    (cond
+     ((and (> this.graph 20000) (< this.graph 30000))
+      (csym::make-2dt (- this.graph 20000)) (= gname "2DTorus.graph"))
+     ((and (> this.graph 30000) (< this.graph 40000))
+      (csym::make-ncube (- this.graph 30000)) (= gname "HCube.graph"))
+     (else
+      (csym::make-random (* 2000 2000) 2)  (= gname "Random4000000.graph") (break))))
+  (csym::gettimeofday (+ tp 1) 0)
+  (csym::fprintf stderr "Graph constuction time: %lf~%" (csym::elapsed-time tp))
+  (csym::fprintf stderr "v: %d e: %d~%" V-Length E-Length)
+  
+  (switch this.show-graph-p
+    (case 1) (csym::show-graph)  (break)
+    (case 2) (csym::show-graph2) (break)
+    )
+
+  (csym::gettimeofday tp 0)
+  ;; making a spanning tree
+  (switch this.algorithm
+    (case 1) (csym::search-s2 0) (= algstr "search-s2") (break)
+    (case 2) (csym::search 0)    (= algstr "search")    (break)
+    (case 3) (search-p 0)        (= algstr "search-p")  (break)
+    (case 4) (search-p-array 0)  (= algstr "search-p-array") (break)
+    (case 99) (csym::dump-graph gname gname) (csym::exit 0)
+    (default) (csym::search-s2 0) (= algstr "search-s2") (break))
+  (csym::gettimeofday (+ tp 1) 0)
+  (csym::fprintf stderr "%s finished.~%time: %lf~%" algstr (csym::elapsed-time tp))
+  (%ifdef* STATISTICS (csym::print-statistics))
+
+  (switch this.show-tree-p
+    (case 1) (csym::show-graph)  (break)
+    (case 2) (csym::show-graph2) (break)
+    )
+
+  (csym::check-graph)
+  )
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

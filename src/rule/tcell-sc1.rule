@@ -1,0 +1,89 @@
+;;; Copyright (c) 2008 Tasuku Hiraishi <hiraisi@kuis.kyoto-u.ac.jp>
+;;; All rights reserved.
+
+;;; Redistribution and use in source and binary forms, with or without
+;;; modification, are permitted provided that the following conditions
+;;; are met:
+;;; 1. Redistributions of source code must retain the above copyright
+;;;    notice, this list of conditions and the following disclaimer.
+;;; 2. Redistributions in binary form must reproduce the above copyright
+;;;    notice, this list of conditions and the following disclaimer in the
+;;;    documentation and/or other materials provided with the distribution.
+
+;;; THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND
+;;; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+;;; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+;;; ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE
+;;; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+;;; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+;;; OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+;;; HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+;;; LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+;;; OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+;;; SUCH DAMAGE.
+
+;;; Tascell with SC1 extension => Tascell
+
+(require-ruleset :tcell)
+(define-ruleset tcell-sc1 (sc1-to-sc0))
+
+(extendrule function-tag tcell-sc1
+  ((#?wfn) x))
+
+(extendrule inlined-declaration tcell-sc1
+  ;;; def task
+  ;; * task-data -> struct
+  ((#?(def (task ,id[identifier]) ,@rest))
+   x)
+  ;; * do_task_body
+  ;; * send_task_body
+  ;; * send_rslt_body
+  ;; * recv_task_body
+  ;; * recv_rslt_body
+  ((#?(def (,task-tag[~(task-body task-sender task-receiver rslt-sender rslt-receiver)]
+                     ,id[identifier]) ,@body))
+   ~(def (,task-tag ,id) ,@(function-body! body)))
+  ;; worker local storage
+  (#?(def worker-data ,@sdecl)
+   ~(def worker-data ,@(mapcar #'struct-declaration! sdecl)))
+  (#?(def worker-init ,@body)
+   ~(def worker-init ,@(function-body! body)) )
+  )
+
+(extendrule statement tcell-sc1
+  ((#?(do-two ,stat1 ,stat2 (,id (:put ,@put-body) (:get ,@get-body))))
+   ~(do-two (begin ,(statement stat1)) (begin ,(statement stat2))
+            (,id
+             (:put ,@(function-body put-body))
+             (:get ,@(function-body get-body)))) )
+  ((#?(do-many for ,var from ,from to ,to
+	,@body
+	(,id
+	 (:put from ,put-from to ,put-to ,@put-body)
+	 (:get ,@get-body))))
+   ~(do-many for ,var from ,(expression from) to ,(expression to)
+      ,@(function-body body)
+      (,id
+       (:put from ,put-from to ,put-to ,@(function-body put-body))
+       (:get ,@(function-body get-body)))) )
+  ((#?(do-many* (,init-exp ,cond-exp ,loop-exp)
+    ,@body
+    (,id
+     (:put ,@put-body)
+     (:get ,@get-body))))
+   ~(do-many* (,(expression init-exp) ,(expression cond-exp) ,(expression loop-exp))
+      ,@(function-body body)
+      (,id
+       (:put ,@(function-body put-body))
+       (:get ,@(function-body get-body)))) )
+  (#?(tcell-broadcast ,id (:put ,@put-body))
+   ~(tcell-broadcast ,id (:put ,@(function-body! put-body))))
+  ((#?(dynamic-wind
+       (:before ,@bef-body)
+       (:body ,@body)
+       (:after ,@aft-body)))
+   ~(dynamic-wind
+      (:before ,@(function-body bef-body))
+      (:body ,@(function-body body))
+      (:after ,@(function-body aft-body))) )
+  )

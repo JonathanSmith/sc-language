@@ -1,0 +1,63 @@
+* SC Preprocessor directives
+
+* (%include <file-name>)
+corresponds to an #include directive in C.
+The file <file-name> is included.
+
+* (%cinclude <cfile-name>)
+<Cfile-name> specifies a C header file.
+The C code is compiled into SC-0 and the result is spliced there.
+The SC programmers can use library functions and most of macros
+such as \|printf| and \|NULL| declared/\|#define|d in C header files.
+
+* (%rule (<rule-set1> ... <rule-setn>))
+is available only in the first application of SC preprocessor.
+This directive specifies the list of rule-sets which the SC program being compiled
+to be applied.
+Each <rule-setk> is a keyword symbol which specifies a rule-set (e.g. :nestfunc)
+or a keyword symbol with arguments to the rule-set (e.g., (:nestfunc :all-in-estack ALL-IN-ESTACK)).
+The :rule keyword parameter of sc2c function, if supplied, overwrites setting of this directive.
+
+* (%defmacro <symbol> <lambda-list> <S-exp> ...)
+evaluated as a defmacro form of Common Lisp to define an SC macro.
+After the definition,
+every list in the form of (<symbol> ...) is replaced with
+the result of the application of Common Lisp's macroexpand-1 function
+to the list.
+The algorithm to expand nested macro applications
+complies with the standard C specification.
+
+* (%defconstant <symbol> <S-exp>)
+defines an SC macro in the same way as a %defmacro directive,
+except that every symbol which "eq"s <symbol> is
+replaced with <S-exp> after the definition.
+
+* (%undef <symbol>)
+undefines the specified macro defined by %defmacros or %defconstants.
+
+* (%ifdef  <symbol> (<body1>) (<body2>))
+* (%ifndef <symbol> (<body1>) (<body2>))
+If the macro specified (not specified) by <symbol> is defined, <body1> is spliced there.
+Otherwise <body2> is spliced.
+
+* (%if <constant> (<body1>) (<body2>))
+<constant> is macro-expanded, and then the result is evaluated by Common Lisp.
+If the return value "eql"s nil or 0, <body2> is spliced there.
+Otherwise <body1> is spliced.
+
+* (%ifdef* <symbol> <body1_1> ... <body1_m> %else <body2_1> ... <body2_n>)
+* (%ifndef* <symbol> <body1_1> ... <body1_m> %else <body2_1> ... <body2_n>)
+* (%if* <constant> <body1_1> ... <body1_m> %else <body2_1> ... <body2_n>)
+equivalent to
+- (%ifdef <symbol> (<body1_1> ... <body1_m>) (<body2_1> ... <body2_n>))
+- (%ifndef <symbol> (<body1_1> ... <body1_m>) (<body2_1> ... <body2_n>))
+- (%if <constant> (<body1_1> ... <body1_m>) (<body2_1> ... <body2_n>))
+respectively.
+
+* (%error <string> <s-exp> ...)
+interrupts the compilation with an error message.
+The message is an evaluation result of (format *error-output* <string> <s-exp>).
+
+* (%output-file <string1> <string2> ... <stringn>)
+Each <stringk> is macro-expanded, and then the name of the output C file is
+changed to (string+ <string1> <string2> ... <stringn> ".c").

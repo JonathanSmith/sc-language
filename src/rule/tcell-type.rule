@@ -1,0 +1,143 @@
+;;; Copyright (c) 2008 Tasuku Hiraishi <hiraisi@kuis.kyoto-u.ac.jp>
+;;; All rights reserved.
+
+;;; Redistribution and use in source and binary forms, with or without
+;;; modification, are permitted provided that the following conditions
+;;; are met:
+;;; 1. Redistributions of source code must retain the above copyright
+;;;    notice, this list of conditions and the following disclaimer.
+;;; 2. Redistributions in binary form must reproduce the above copyright
+;;;    notice, this list of conditions and the following disclaimer in the
+;;;    documentation and/or other materials provided with the distribution.
+
+;;; THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND
+;;; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+;;; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+;;; ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE
+;;; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+;;; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+;;; OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+;;; HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+;;; LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+;;; OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+;;; SUCH DAMAGE.
+
+(require-ruleset :tcell)
+(define-ruleset tcell-type (type-info))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defpackage :tcell-type
+  (:export :with-task))
+(in-package :tcell-type)
+(defmacro with-task (task-id &body body)
+  `(type:with-new-environment
+       (tcell:with-worker-data
+         (type:add-variable ~this (list ~struct ,task-id))
+         (type:add-variable ~pthis (list ~ptr (list ~struct ,task-id)))
+         ,@body)))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(in-package :rule)
+
+(extendrule function-tag tcell-type
+  ((#?wfn) x))
+
+(extendrule declaration tcell-type
+  ;;; def task
+  ;; * task-data -> struct
+  ((#?(def (task ,id) ,@mem-decls))
+   (multiple-value-bind (member-alist sdecl-with-type)
+       (type:get-struct-member-info (mapcar (suffixed-func #'firstn 3)
+                                            mem-decls))
+     (type:add-struct id member-alist)
+     ~(def (task ,id)
+           ,@(mapcar #'append
+                     sdecl-with-type (mapcar #'cdddr mem-decls)))))
+  ;; * do_task_body
+  ;; * send_task_body
+  ;; * send_rslt_body
+  ;; * recv_task_body
+  ;; * recv_rslt_body
+  ((#?(def (,task-tag[~(task-body task-sender task-receiver rslt-sender rslt-receiver)]
+                     ,id[identifier]) ,@body))
+   (error-indent (format nil "In ~S of ~S" task-tag id)
+     (tcell-type:with-task id
+       ~(def (,task-tag ,id) ,@(function-body body)))) )
+  ;; worker local storage
+  (#?(def worker-data ,@sdeclist)
+   (multiple-value-bind (member-alist sdecl-with-type)
+       (type:get-struct-member-info sdeclist)
+     (type:add-struct ~worker-data member-alist)
+     ~(def worker-data ,@sdecl-with-type) ))
+  (#?(def worker-init ,@body)
+   (type:with-new-environment
+       (tcell:with-worker-data
+           ~(def worker-init ,@(function-body! body)) )))
+  )
+
+(extendrule inlined-declaration tcell-type
+  ;; worker function
+  (#?(,scs[storage-class-specifier] (,@id-list)
+          (wfn ,@texp-list {,va-arg[vaarg-tag]}) ,@body)
+     (tcell:with-worker-data (call-next-rule)))
+  )
+
+(extendrule block-item tcell-type
+  ((#?(do-two ,stat1 ,stat2
+              (,id[identifier] (:put ,@put-body) (:get ,@get-body))))
+   ~(do-two ,(block-item stat1) ,(block-item stat2)
+            ,(tcell-type:with-task id
+               ~(,id
+                 (:put ,@(type:with-new-environment (function-body put-body)))
+                 (:get ,@(type:with-new-environment (function-body get-body))))))  )
+  ((#?(do-many for ,var from ,from to ,to
+               ,@body
+               (,id
+                (:put from ,put-from to ,put-to ,@put-body)
+                (:get ,@get-body))))
+   (type:with-new-environment
+    (type:add-variable var ~int)
+    ~(do-many for ,var from ,(expression from) to ,(expression to)
+       ,@(function-body body)
+       ,(tcell-type:with-task id
+         ~(,id
+           (:put from ,put-from to ,put-to
+                 ,@(type:with-new-environment
+                     (type:add-variable put-from ~int)
+                     (type:add-variable put-to ~int)
+                     (function-body put-body)))
+           (:get ,@(type:with-new-environment (function-body get-body))))))) )
+  ((#?(do-many* (,init-exp ,cond-exp ,loop-exp)
+                ,@body
+                (,id
+                  (:put ,@put-body)
+                  (:get ,@get-body))))
+   (type:with-new-environment
+    ~(do-many* (,(expression init-exp) ,(expression cond-exp) ,(expression loop-exp))
+       ,@(function-body body)
+       ,(tcell-type:with-task id
+         ~(,id
+           (:put ,@(type:with-new-environment (function-body put-body)))
+           (:get ,@(type:with-new-environment (function-body get-body))))))) )
+  (#?(tcell-broadcast ,id (:put ,@put-body))
+   ~(tcell-broadcast ,id (:put ,@(type:with-new-environment
+                                   (function-body! put-body)))) )
+  ((#?(dynamic-wind
+       (:before ,@bef-body)
+       (:body ,@body)
+       (:after ,@aft-body)))
+    ~(dynamic-wind
+      (:before ,@(type:with-new-environment (function-body bef-body)))
+      (:body ,@(type:with-new-environment (function-body body)))
+      (:after ,@(type:with-new-environment (function-body aft-body)))) )
+  )
+
+(extendrule expression tcell-type
+  (#?WDATA
+   (if (tcell:wdata-accessible-p)
+       ~(the (struct worker-data) WDATA)
+     (next-pattern)))
+  (#?WORKER-ID
+   (if (tcell:wdata-accessible-p)
+       ~(the int WORKER-ID)
+     (next-pattern)))
+  )

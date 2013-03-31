@@ -1,0 +1,178 @@
+;;; Copyright (c) 2008 Tasuku Hiraishi <hiraisi@kuis.kyoto-u.ac.jp>
+;;; All rights reserved.
+
+;;; Redistribution and use in source and binary forms, with or without
+;;; modification, are permitted provided that the following conditions
+;;; are met:
+;;; 1. Redistributions of source code must retain the above copyright
+;;;    notice, this list of conditions and the following disclaimer.
+;;; 2. Redistributions in binary form must reproduce the above copyright
+;;;    notice, this list of conditions and the following disclaimer in the
+;;;    documentation and/or other materials provided with the distribution.
+
+;;; THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND
+;;; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+;;; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+;;; ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE
+;;; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+;;; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+;;; OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+;;; HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+;;; LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+;;; OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+;;; SUCH DAMAGE.
+
+;;; hoisting.rule:
+;;; * Moves all the declarations to the beginning of a function body.
+;;; * Splits a declaration with an initializer into a one without initializer and
+;;;   an assignment expression for initialization.
+;;; * This transformation should follow rename.rule's transformation.
+
+(defpackage "HOIST"
+  (:nicknames "HST")
+  (:use "CL" "SC-MISC")
+  (:export :with-hoist-env :with-new-func :top-level-p :finfo-add-decl :finfo-flush-decls
+           :remove-const :split-decl-and-body))
+
+(in-package "HOIST")
+
+(defstruct finfo
+  (decls ()))
+
+(defvar *current-func* nil)
+
+(defmacro with-hoist-env (&body body)
+  `(with1 *current-func* nil ,@body))
+
+(defmacro with-new-func (&body body)
+  `(with1 *current-func* (make-finfo) ,@body))
+
+(defun top-level-p () (not *current-func*))
+
+(defun finfo-add-decl (decl &optional (finfo *current-func*))
+  (push decl (finfo-decls finfo)))
+
+(defun finfo-flush-decls (&optional (finfo *current-func*))
+  (prog1 (nreverse (finfo-decls finfo))
+    (setf (finfo-decls finfo) ())))
+
+(defun remove-const (x)
+  (when (not (listp x)) (return-from remove-const x))
+  (setq x (remove ~const x))
+  (when (= 1 (length x))
+    (return-from remove-const (remove-const (car x))))
+  (mapcar #'remove-const x))
+
+;; declaration, block-item の返り値を宣言部とbody部に分ける
+(defun split-decl-and-body (x)
+  (list (apply #'append (mapcar #'first x))
+        (remove nil (mapcar #'second x))))
+
+(defvar *top-level* t)
+
+(in-package "RULE")
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define-ruleset hoist (sc0-to-sc0))
+
+(defrule sc-program hoist
+  (otherwise
+   (hst:with-hoist-env (call-next-rule) ))
+  )
+
+;;; 以下, declaration, block-item の返り値は、
+;;; (<関数本体の先頭に出すS式のリスト>
+;;;  <元の場所に残すS式>)
+
+;;; declaration
+(defrule inlined-declaration hoist
+  ;; variable (without initializer)
+  (#?(,scs[storage-class-specifier] ,id[#'atom] ,texp)
+   (if (hst:top-level-p) x
+     (progn
+       (hst:finfo-add-decl x)
+       ~(%splice))))
+  ;; variable (with initializer)
+  (#?(,scs[storage-class-specifier] ,id[#'atom] ,texp ,init)
+   (if (hst:top-level-p) x
+     (with1 raw-texp (remove-type-qualifier texp nil)
+       (cond                            ; What is initializer?
+        ;; string-literal
+        ((sc-string? init)
+         (with1 new-texp (if (and (tagged-p raw-texp ~array)
+                                  (endp (cddr raw-texp))) ; array size not specified
+                             ~(,(first raw-texp) ,(second raw-texp) ,(sc-string-length init))
+                           raw-texp)
+           (hst:finfo-add-decl ~(,scs ,id ,new-texp))
+           ~(= ,id ,init) ))
+        ;; array initializer
+        ((tagged-p ~array init)
+         (with1 new-texp (if (and (tagged-p raw-texp ~array)
+                                  (endp (cddr raw-texp))) ; array size not specified
+                             ~(,(first raw-texp) ,(second raw-texp) ,(max-referred-index init))
+                           raw-texp)
+           (hst:finfo-add-decl ~(,scs ,id ,new-texp))
+           ~(= ,id (init ,raw-texp ,init)) )) ; assign initial value using compound literal
+        ;; struct initializer
+        ((tagged-p ~struct init)
+         (hst:finfo-add-decl ~(,scs ,id ,raw-texp))
+         ~(= ,id (init ,raw-texp ,init)) ) ; assign initial value using compound literal
+        ;; otherwise
+        (t
+         (hst:finfo-add-decl ~(,scs ,id ,raw-texp))
+         ~(= ,id ,init) )))))
+
+  ;; function
+  (#?(,scs[storage-class-specifier] (,@id-list[identifier])
+       (,fn-tag[function-tag] ,@texp-list) ,@body)
+   (with1 ret (hst:with-new-func
+                  (with1 body-ret (function-body body)
+                    ~(,scs (,@id-list) (,fn-tag ,@texp-list)
+                           ,.(hst:finfo-flush-decls) ,@body-ret)))
+     (if (hst:top-level-p) ret
+       (progn
+         (hst:finfo-add-decl ret)
+         ~(%splice)))))
+  ;; other kinds of definitions/declarations
+  (#?,decl[call-next-rule]
+   (with1 ret (get-retval decl)
+     (if (hst:top-level-p) ret
+       (progn
+         (hst:finfo-add-decl ret)
+         ~(%splice)))))
+  )
+
+(defrule function-body hoist
+  (#?({:attr ,f-attr} { ,r-decl[register-declarator] } ,@bi-list)
+   (if-pattern-variable f-attr
+                        (progn (hst:finfo-add-decl :attr)
+                               (hst:finfo-add-decl (function-attribute f-attr))))
+   (if-pattern-variable r-decl (hst:finfo-add-decl (get-retval r-decl)))
+   (mapcar #'block-item bi-list) )
+  )
+
+(defrule struct-declaration hoist
+  (otherwise
+   (hst:with-new-func                   ; ダミーの関数を置いて，add-declされた宣言を捕まえる
+       (with1 ret (call-next-rule)
+         ~(%splice ,.(hst:finfo-flush-decls) ,ret) )))
+  )
+
+;;; 配列初期化子で参照される最大のindex数
+(defrule max-referred-index hoist
+  (#?(array ,@inits)
+   (with1 cnt 0
+     (loop for init in inits
+         do (aif (referred-index init)
+                (setq cnt it)
+              (incf cnt)))))
+  )
+(defrule referred-index hoist
+  ;; initializer with designator
+  (#?((aref-this ,@exp-list) ,init)
+   (eval (car exp-list)) )              ; 添字がLispで評価できる式であることを仮定
+  (#?((aref ,desig ,@exp-list) ,init)
+   (referred-index ~(,desig ,init)))
+  ;; initializer without designator
+  (otherwise nil)
+  )

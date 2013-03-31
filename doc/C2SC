@@ -1,0 +1,17 @@
+How to set up CtoSC Compiler
+
+1.
+ cd src/c2scpp
+
+2.
+ ./configure && make
+
+3. Add
+    (%cinclude "<stdio.h>" (:macro))
+   into your SC code to include declarations in <stdio.h>.
+
+4. To include C macros, set the :macro keyword argument as
+    (%cinclude "<stdio.h>" (:macro NULL stdin stdout)).
+
+5. To include multiple C header files, write as
+    (%cinclude "<stdio.h>" "<math.h>" (:macro NULL stdin stdout)).
