@@ -475,6 +475,8 @@
   ;; <== [trick] remove redundant block
   ((#?(begin (,stag[statement-tag] ,@rem)))
    (statement ~(,stag ,@rem)) )
+  ((#?(splice (,stag[statement-tag] ,@rem)))
+   (statement ~(,stag ,@rem)))
   ((#?(loop (begin ,@rem)))
    (statement ~(loop ,@rem)))
   ;; ==>
@@ -496,6 +498,10 @@
    (list "{" #\Newline
          (get-retval bi-list)
          "}" #\Newline) )
+  ((#?(splice ,@bi-list[block-item]))
+   (list  #\Newline
+         (get-retval bi-list)
+          #\Newline))
   ((#?(let (,@decl-list[declaration]) ,@bi-list[block-item]))
    (list "{" #\Newline
          (get-retval decl-list)
@@ -635,6 +641,7 @@
 
 (defrule compound-statement-tag sc2c
   ((#?begin)        "")
+  ((#?splice)        "")
   ((#?let)          "")                 ; sc1
   )
 
