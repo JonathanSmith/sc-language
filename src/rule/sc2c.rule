@@ -473,7 +473,7 @@
 
 (defrule statement sc2c
   ;; <== [trick] remove redundant block
-  ((#?(begin (,stag[statement-tag] ,@rem)))
+  ((#?(begin (,stag[non-splice-statement-tag] ,@rem)))
    (statement ~(,stag ,@rem)) )
   ((#?(splice (,stag[statement-tag] ,@rem)))
    (statement ~(,stag ,@rem)))
@@ -482,6 +482,7 @@
   ;; ==>
   ((#?,stat[compound-statement]
     #?,stat[selection-statement]
+    #?,state[splice-statement]
     #?,stat[iteration-statement]
     #?,stat[jump-statement]
     #?,stat[labeled-statement]
@@ -507,8 +508,13 @@
          (get-retval decl-list)
          #\Newline
          (get-retval bi-list)
-         "}" #\Newline))
-  )
+         "}" #\Newline)))
+
+(defrule splice-statement sc2c
+  ((#?(splice ,@bi-list[block-item]))
+   (list  #\Newline
+         (get-retval bi-list)
+          #\Newline)))
 
 (defrule block-item sc2c
   ((#?,bi[inlined-declaration]
@@ -534,7 +540,7 @@
 
 (defrule selection-statement sc2c
   ;; [trick] 余分なbeginをとる（↓のtrickが使えるパターンを増やすため）
-  (#?(if ,exp (begin (,stag[statement-tag] ,@rem)))
+  (#?(if ,exp (begin (,stag[non-splice-statement-tag] ,@rem)))
    (statement ~(if ,exp (,stag ,@rem))))
   ;;
   (#?(cond ,@clauses)
@@ -627,11 +633,19 @@
 (defrule statement-tag sc2c
   ((#?,tag[labeled-statement-tag]
     #?,tag[compound-statement-tag]
+    #?,tag[splice-statement-tag]
     #?,tag[selection-statement-tag]
     #?,tag[iteration-statement-tag]
     #?,tag[jump-statement-tag])
-   (get-retval tag))
-  )
+   (get-retval tag)))
+
+(defrule non-splice-statement-tag sc2c
+  ((#?,tag[labeled-statement-tag]
+    #?,tag[compound-statement-tag]
+    #?,tag[selection-statement-tag]
+    #?,tag[iteration-statement-tag]
+    #?,tag[jump-statement-tag])
+   (get-retval tag)))
 
 (defrule labeled-statement-tag sc2c
   ((#?label)        ":")
@@ -639,11 +653,12 @@
   ((#?default)      "defalut")
   )
 
+(defrule splice-statement-tag sc2c
+  ((#?splice)        ""))
+
 (defrule compound-statement-tag sc2c
-  ((#?begin)        "")
-  ((#?splice)        "")
-  ((#?let)          "")                 ; sc1
-  )
+  ((#?begin)        "")  
+  ((#?let)          ""))                 ; sc1
 
 (defrule selection-statement-tag sc2c
   ((#?if)           "if")

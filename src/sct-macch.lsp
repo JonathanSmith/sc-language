@@ -216,7 +216,8 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;; パターンを扱う関数・マクロ
 
-(defstruct (:pattern (:print-function pattern-print))
+(defstruct #+lispworks(pattern (:print-function pattern-print))
+           #-lispworks (:pattern (:print-function pattern-print))
   body
   (_matching-list :uninitialized))
 

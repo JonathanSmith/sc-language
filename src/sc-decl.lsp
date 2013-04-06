@@ -63,14 +63,18 @@
 #+(and allegro mswindows)
 (defun gethostname () (sys:getenv "COMPUTERNAME"))
 
+#+sbcl
+(defun gethostname () (machine-instance))
+#+lispworks 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun gethostname () (machine-instance))
+  (defun user-savepath () (user-homedir-pathname)))
+
+
 #+(or sbcl clisp (and allegro (not mswindows)))
 (defun user-savepath () (user-homedir-pathname))
 #+(and allegro mswindows)
 (defun user-savepath () (format nil "~A\\" (sys:getenv "APPDATA")))
-
-#+(or sbcl lispworks)
-(defun gethostname () (machine-instance))
-
 
 (defvar *sc-system-path* (make-pathname :directory (pathname-directory *load-pathname*)))
 (defvar *auto-compile* t)
@@ -154,15 +158,23 @@
          ((> lisp-date fasl-date)
           (ensure-directories-exist (make-pathname :directory fasl-dir))
           (return (if *auto-compile*
-                      (cl:load (compile-file lisp-path :output-file fasl-path))
+                      (let ((pathname (compile-file lisp-path :output-file fasl-path :verbose t :print t)))
+                        (pprint lisp-path)
+                        (pprint pathname)
+                        (cl:load pathname))
                     (cl:require module-name lisp-path))))
          (t nil))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Define packages, dynamic variables, constants, and features
 
-(when (find-symbol "READTABLE-CASE" "CL")
-  (pushnew :readtable-case *features*))
+#.(progn (when (find-symbol "READTABLE-CASE" "CL")
+           (pushnew :readtable-case *features*))
+         nil)
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (when (find-symbol "READTABLE-CASE" "CL")
+    (pushnew :readtable-case *features*)))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -281,7 +293,7 @@
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (defpackage "RULE"
-  (:nicknames "RULE" "SC-TRANSFORMER-USER" "SCT-USER")
+  (:nicknames #-lispworks "RULE" "SC-TRANSFORMER-USER" "SCT-USER")
   (:use "SC-MISC" "CL")
   (:shadow cl:declaration)
   (:export

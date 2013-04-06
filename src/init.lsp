@@ -66,7 +66,12 @@
 (shadow 'cl:declaration)                ; Avoid name conflict with rule:declaration
 (unless
     (catch :sc-decl-exception
-      (load (make-pathname :name "sc-decl" :type "lsp"
+      #+lispworks 
+      (let ((pathname (compile-file (make-pathname :name "sc-decl" :type "lsp"
+                                                   :directory (pathname-directory *load-pathname*)))))
+        (pprint pathname)
+        (load pathname))
+      #-lispworks (load (make-pathname :name "sc-decl" :type "lsp"
                            :directory (pathname-directory *load-pathname*)))
       t)
   (bye 1))

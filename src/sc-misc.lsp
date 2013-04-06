@@ -163,7 +163,7 @@
 
 ;;; コマンドラインの実行（実装依存部分を吸収）
 #+(and allegro mswindows) (defparameter *sh-command* "\\cygwin\\bin\\sh.exe")
-#+(or allegro kcl sbcl ecl cmu clisp)
+#+(or allegro lispworks kcl sbcl ecl cmu clisp)
 (defun command-line (command &key args verbose other-options)
   (declare (string command) #+nil(list verbose) (list other-options))
   (let* ((quoted-cmd-args (mapcar #'(lambda (x) (add-paren
@@ -194,16 +194,15 @@
            other-options)
     #+sbcl
     (apply #'sb-ext:run-program command args
-		  :search t
-		  :wait t
-		  other-options)
+           :search t
+           :wait t
+           other-options)
     #+lispworks
-    (apply #'system:run-program  
-	   command
-	   :arguments
-	   args
-	   :wait t
-	   other-options)))
+    (system:run-shell-command           
+     (if args 
+         (reduce (lambda (x y) (format nil "~a ~a" x y)) (cons command args))
+         command)
+     :wait t)))
 
 ;;;;; ファイル操作
 
